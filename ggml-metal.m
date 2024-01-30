@@ -24,19 +24,7 @@
 
 #define UNUSED(x) (void)(x)
 
-#define GGML_METAL_MAX_KERNELS 256
-
-struct ggml_metal_buffer {
-    const char * name;
-
-    void   * data;
-    size_t   size;
-
-    id<MTLBuffer> metal;
-};
-
 struct ggml_metal_kernel {
-    id<MTLFunction>             function;
     id<MTLComputePipelineState> pipeline;
 };
 
@@ -168,14 +156,10 @@ struct ggml_metal_context {
 
     id<MTLDevice>       device;
     id<MTLCommandQueue> queue;
-    id<MTLLibrary>      library;
 
     dispatch_queue_t d_queue;
 
-    int n_buffers;
-    struct ggml_metal_buffer buffers[GGML_METAL_MAX_BUFFERS];
-
-    struct ggml_metal_kernel kernels[GGML_METAL_MAX_KERNELS];
+    struct ggml_metal_kernel kernels[GGML_METAL_KERNEL_TYPE_COUNT];
 
     bool support_simdgroup_reduction;
     bool support_simdgroup_mm;
@@ -242,25 +226,23 @@ static struct ggml_metal_context * ggml_metal_init(int n_cb) {
     // Show all the Metal device instances in the system
     NSArray * devices = MTLCopyAllDevices();
     for (id<MTLDevice> device in devices) {
-        NSString * s = [device name];
-        GGML_METAL_LOG_INFO("%s: found device: %s\n", __func__, [s UTF8String]);
+        GGML_METAL_LOG_INFO("%s: found device: %s\n", __func__, [[device name] UTF8String]);
     }
     [devices release]; // since it was created by a *Copy* C method
 #endif
 
     // Pick and show default Metal device
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-    NSString * s = [device name];
-    GGML_METAL_LOG_INFO("%s: picking default device: %s\n", __func__, [s UTF8String]);
+    GGML_METAL_LOG_INFO("%s: picking default device: %s\n", __func__, [[device name] UTF8String]);
 
     // Configure context
     struct ggml_metal_context * ctx = malloc(sizeof(struct ggml_metal_context));
     ctx->device = device;
     ctx->n_cb   = MIN(n_cb, GGML_METAL_MAX_BUFFERS);
     ctx->queue  = [ctx->device newCommandQueue];
-    ctx->n_buffers = 0;
-
     ctx->d_queue = dispatch_queue_create("ggml-metal", DISPATCH_QUEUE_CONCURRENT);
+
+    id<MTLLibrary> metal_library;
 
     // load library
     {
@@ -276,7 +258,7 @@ static struct ggml_metal_context * ggml_metal_init(int n_cb) {
             // pre-compiled library found
             NSURL * libURL = [NSURL fileURLWithPath:libPath];
             GGML_METAL_LOG_INFO("%s: loading '%s'\n", __func__, [libPath UTF8String]);
-            ctx->library = [ctx->device newLibraryWithURL:libURL error:&error];
+            metal_library = [ctx->device newLibraryWithURL:libURL error:&error];
             if (error) {
                 GGML_METAL_LOG_ERROR("%s: error: %s\n", __func__, [[error description] UTF8String]);
                 return NULL;
@@ -318,7 +300,7 @@ static struct ggml_metal_context * ggml_metal_init(int n_cb) {
 
                 //[options setFastMathEnabled:false];
 
-                ctx->library = [ctx->device newLibraryWithSource:src options:options error:&error];
+                metal_library = [ctx->device newLibraryWithSource:src options:options error:&error];
                 if (error) {
                     GGML_METAL_LOG_ERROR("%s: error: %s\n", __func__, [[error description] UTF8String]);
                     return NULL;
@@ -383,8 +365,7 @@ static struct ggml_metal_context * ggml_metal_init(int n_cb) {
     {
         NSError * error = nil;
 
-        for (int i = 0; i < GGML_METAL_MAX_KERNELS; ++i) {
-            ctx->kernels[i].function = nil;
+        for (int i = 0; i < GGML_METAL_KERNEL_TYPE_COUNT; ++i) {
             ctx->kernels[i].pipeline = nil;
         }
 
@@ -396,10 +377,12 @@ static struct ggml_metal_context * ggml_metal_init(int n_cb) {
 #define GGML_METAL_ADD_KERNEL(e, name, supported) \
         if (supported) { \
             struct ggml_metal_kernel * kernel = &ctx->kernels[e]; \
-            kernel->function = [ctx->library newFunctionWithName:@"kernel_"#name]; \
-            kernel->pipeline = [ctx->device newComputePipelineStateWithFunction:kernel->function error:&error]; \
+            id<MTLFunction> metal_function = [metal_library newFunctionWithName:@"kernel_"#name]; \
+            kernel->pipeline = [ctx->device newComputePipelineStateWithFunction:metal_function error:&error]; \
+            [metal_function release]; \
             if (error) { \
                 GGML_METAL_LOG_ERROR("%s: error: load pipeline error: %s\n", __func__, [[error description] UTF8String]); \
+                [metal_library release]; \
                 return NULL; \
             } \
         } else { \
@@ -528,27 +511,17 @@ static struct ggml_metal_context * ggml_metal_init(int n_cb) {
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_SUM_ROWS,                  sum_rows,               true);
     }
 
+    [metal_library release];
     return ctx;
 }
 
 static void ggml_metal_free(struct ggml_metal_context * ctx) {
     GGML_METAL_LOG_INFO("%s: deallocating\n", __func__);
 
-    for (int i = 0; i < ctx->n_buffers; ++i) {
-        [ctx->buffers[i].metal release];
+    for (int i = 0; i < GGML_METAL_KERNEL_TYPE_COUNT; ++i) {
+        [ctx->kernels[i].pipeline release];
     }
 
-    for (int i = 0; i < GGML_METAL_MAX_KERNELS; ++i) {
-        if (ctx->kernels[i].pipeline) {
-            [ctx->kernels[i].pipeline release];
-        }
-
-        if (ctx->kernels[i].function) {
-            [ctx->kernels[i].function release];
-        }
-    }
-
-    [ctx->library release];
     [ctx->queue release];
     [ctx->device release];
 
@@ -580,51 +553,30 @@ struct ggml_backend_metal_buffer_context {
 // the assumption is that there is 1-to-1 mapping between the host and device memory buffers, so we can find the
 // Metal buffer based on the host memory pointer
 //
-static id<MTLBuffer> ggml_metal_get_buffer(struct ggml_metal_context * ctx, struct ggml_tensor * t, size_t * offs) {
+static id<MTLBuffer> ggml_metal_get_buffer(struct ggml_tensor * t, size_t * offs) {
     //GGML_METAL_LOG_INFO("%s: data tensor '%16s', offs_data = %8ld, offs_eval = %8ld, offs_cach = %8ld\n", __func__, t->name, offs_data, offs_eval, offs_cach);
 
     const int64_t tsize = ggml_nbytes(t);
 
     ggml_backend_buffer_t buffer = t->view_src ? t->view_src->buffer : t->buffer;
 
-    // compatibility with ggml-backend
-    if (buffer && buffer->buft == ggml_backend_metal_buffer_type()) {
-        struct ggml_backend_metal_buffer_context * buf_ctx = (struct ggml_backend_metal_buffer_context *) buffer->context;
-
-        // find the view that contains the tensor fully
-        for (int i = 0; i < buf_ctx->n_buffers; ++i) {
-            const int64_t ioffs = (int64_t) t->data - (int64_t) buf_ctx->buffers[i].data;
-
-            //GGML_METAL_LOG_INFO("ioffs = %10ld, tsize = %10ld, sum = %10ld, buf_ctx->buffers[%d].size = %10ld\n", ioffs, tsize, ioffs + tsize, i, buf_ctx->buffers[i].size);
-            if (ioffs >= 0 && ioffs + tsize <= (int64_t) buf_ctx->buffers[i].size) {
-                *offs = (size_t) ioffs;
-
-                //GGML_METAL_LOG_INFO("%s: tensor '%16s', offs = %8ld\n", __func__, t->name, *offs);
-
-                return buf_ctx->buffers[i].metal;
-            }
-        }
-
-        GGML_METAL_LOG_ERROR("%s: error: tensor '%s' buffer is nil\n", __func__, t->name);
-
-        return nil;
-    }
+    struct ggml_backend_metal_buffer_context * buf_ctx = (struct ggml_backend_metal_buffer_context *) buffer->context;
 
     // find the view that contains the tensor fully
-    for (int i = 0; i < ctx->n_buffers; ++i) {
-        const int64_t ioffs = (int64_t) t->data - (int64_t) ctx->buffers[i].data;
+    for (int i = 0; i < buf_ctx->n_buffers; ++i) {
+        const int64_t ioffs = (int64_t) t->data - (int64_t) buf_ctx->buffers[i].data;
 
-        //GGML_METAL_LOG_INFO("ioffs = %10ld, tsize = %10ld, sum = %10ld, ctx->buffers[%d].size = %10ld, name = %s\n", ioffs, tsize, ioffs + tsize, i, ctx->buffers[i].size, ctx->buffers[i].name);
-        if (ioffs >= 0 && ioffs + tsize <= (int64_t) ctx->buffers[i].size) {
+        //GGML_METAL_LOG_INFO("ioffs = %10ld, tsize = %10ld, sum = %10ld, buf_ctx->buffers[%d].size = %10ld\n", ioffs, tsize, ioffs + tsize, i, buf_ctx->buffers[i].size);
+        if (ioffs >= 0 && ioffs + tsize <= (int64_t) buf_ctx->buffers[i].size) {
             *offs = (size_t) ioffs;
 
-            //GGML_METAL_LOG_INFO("%s: '%s' tensor '%16s', offs = %8ld\n", __func__, ctx->buffers[i].name, t->name, *offs);
+            //GGML_METAL_LOG_INFO("%s: tensor '%16s', offs = %8ld\n", __func__, t->name, *offs);
 
-            return ctx->buffers[i].metal;
+            return buf_ctx->buffers[i].metal;
         }
     }
 
-    GGML_METAL_LOG_ERROR("%s: error: buffer is nil\n", __func__);
+    GGML_METAL_LOG_ERROR("%s: error: tensor '%s' buffer is nil\n", __func__, t->name);
 
     return nil;
 }
@@ -817,9 +769,9 @@ static bool ggml_metal_graph_compute(
             const enum ggml_type src1t = src1 ? src1->type : GGML_TYPE_COUNT;
             const enum ggml_type dstt  = dst  ? dst->type  : GGML_TYPE_COUNT;
 
-            id<MTLBuffer> id_src0 = src0 ? ggml_metal_get_buffer(ctx, src0, &offs_src0) : nil;
-            id<MTLBuffer> id_src1 = src1 ? ggml_metal_get_buffer(ctx, src1, &offs_src1) : nil;
-            id<MTLBuffer> id_dst  = dst  ? ggml_metal_get_buffer(ctx, dst,  &offs_dst)  : nil;
+            id<MTLBuffer> id_src0 = src0 ? ggml_metal_get_buffer(src0, &offs_src0) : nil;
+            id<MTLBuffer> id_src1 = src1 ? ggml_metal_get_buffer(src1, &offs_src1) : nil;
+            id<MTLBuffer> id_dst  = dst  ? ggml_metal_get_buffer(dst,  &offs_dst)  : nil;
 
             //GGML_METAL_LOG_INFO("%s: op - %s\n", __func__, ggml_op_name(dst->op));
             //if (src0) {
@@ -1601,7 +1553,7 @@ static bool ggml_metal_graph_compute(
                                 struct ggml_tensor * src_cur = dst->src[2 + (j % n_as)];
 
                                 size_t offs_src_cur = 0;
-                                id<MTLBuffer> id_src_cur = ggml_metal_get_buffer(ctx, src_cur, &offs_src_cur);
+                                id<MTLBuffer> id_src_cur = ggml_metal_get_buffer(src_cur, &offs_src_cur);
 
                                 [encoder setBuffer:id_src_cur offset:offs_src_cur atIndex:19 + j];
                             }
@@ -1746,7 +1698,7 @@ static bool ggml_metal_graph_compute(
                                 struct ggml_tensor * src_cur = dst->src[2 + (j % n_as)];
 
                                 size_t offs_src_cur = 0;
-                                id<MTLBuffer> id_src_cur = ggml_metal_get_buffer(ctx, src_cur, &offs_src_cur);
+                                id<MTLBuffer> id_src_cur = ggml_metal_get_buffer(src_cur, &offs_src_cur);
 
                                 [encoder setBuffer:id_src_cur offset:offs_src_cur atIndex:23 + j];
                             }
@@ -2423,6 +2375,16 @@ GGML_CALL static size_t ggml_backend_metal_buffer_type_get_alignment(ggml_backen
     UNUSED(buft);
 }
 
+GGML_CALL static size_t ggml_backend_metal_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+    id<MTLDevice> device = ggml_backend_metal_get_device();
+    size_t max_size = device.maxBufferLength;
+    ggml_backend_metal_free_device();
+
+    return max_size;
+
+    UNUSED(buft);
+}
+
 GGML_CALL static bool ggml_backend_metal_buffer_type_supports_backend(ggml_backend_buffer_type_t buft, ggml_backend_t backend) {
     return ggml_backend_is_metal(backend) || ggml_backend_is_cpu(backend);
 
@@ -2441,6 +2403,7 @@ GGML_CALL ggml_backend_buffer_type_t ggml_backend_metal_buffer_type(void) {
             /* .get_name         = */ ggml_backend_metal_buffer_type_get_name,
             /* .alloc_buffer     = */ ggml_backend_metal_buffer_type_alloc_buffer,
             /* .get_alignment    = */ ggml_backend_metal_buffer_type_get_alignment,
+            /* .get_max_size     = */ ggml_backend_metal_buffer_type_get_max_size,
             /* .get_alloc_size   = */ NULL, // defaults to ggml_nbytes
             /* .supports_backend = */ ggml_backend_metal_buffer_type_supports_backend,
             /* .is_host          = */ ggml_backend_metal_buffer_type_is_host,
